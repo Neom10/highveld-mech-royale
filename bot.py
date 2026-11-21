@@ -1,3 +1,5 @@
+from array import array
+import heapq
 import json
 import math
 from pathlib import Path
@@ -23,6 +25,10 @@ class Arena:
     def __init__(self, directory):
         world = json.loads((Path(directory) / "v2/world.json").read_text())
         self.bounds = world["bounds"]
+        self.terrain = world["terrain"]
+        self.heights = array("h")
+        with (Path(directory) / "v2/terrain.i16").open("rb") as terrain_file:
+            self.heights.fromfile(terrain_file,self.terrain["nx"]*self.terrain["ny"])
         self.cells = {}
         for prism in world["prisms"]:
             rings = [prism["ring"], *prism["holes"]]
@@ -39,6 +45,60 @@ class Arena:
                     for col in range(math.ceil((left-2)/4), math.ceil((right-2)/4)):
                         self.cells.setdefault((col,row), []).append((prism["base"],prism["top"]))
 
+        # Cache traversable ground nodes once, while the hello budget is active.
+        self.walkable = set()
+        b = self.bounds
+        for i in range(math.ceil((b["minX"]+3)/8),math.floor((b["maxX"]-3)/8)+1):
+            for j in range(math.ceil((b["minY"]+3)/8),math.floor((b["maxY"]-3)/8)+1):
+                if all(self.open_ground(i*8+dx,j*8+dy) for dx,dy in
+                       ((0,0),(-2,-2),(-2,2),(2,-2),(2,2))):
+                    self.walkable.add((i,j))
+
+    def ground(self,x,y):
+        t = self.terrain
+        i = min(t["nx"]-1,max(0,round((x-t["minX"])/t["step"])))
+        j = min(t["ny"]-1,max(0,round((y-t["minY"])/t["step"])))
+        return self.heights[j*t["nx"]+i]/100
+
+    def open_ground(self,x,y):
+        z = self.ground(x,y)
+        return not self.solid(x,y,z+1.2,z+9)
+
+    def route(self,pos,goal):
+        def snap(point):
+            i,j = round(point[0]/8),round(point[1]/8)
+            return min(((i+u,j+v) for u in range(-2,3) for v in range(-2,3)
+                        if (i+u,j+v) in self.walkable),
+                       key=lambda n: distance((8*n[0],8*n[1]),point),default=None)
+        start,end = snap(pos),snap(goal)
+        if start is None or end is None:
+            return []
+        frontier = [(distance(start,end),0,start)]
+        parent,cost = {start:None},{start:0}
+        for _ in range(1200):
+            if not frontier:
+                return []
+            _,g,node = heapq.heappop(frontier)
+            if node == end:
+                path = []
+                while parent[node] is not None:
+                    path.append((node[0]*8,node[1]*8))
+                    node = parent[node]
+                return path[::-1]
+            if g != cost[node]:
+                continue
+            i,j = node
+            for u,v in ((1,0),(-1,0),(0,1),(0,-1),(1,1),(-1,1),(1,-1),(-1,-1)):
+                n = (i+u,j+v)
+                if n not in self.walkable or (u and v and
+                        ((i+u,j) not in self.walkable or (i,j+v) not in self.walkable)):
+                    continue
+                ng = g+(1.4143 if u and v else 1)
+                if ng < cost.get(n,math.inf):
+                    cost[n],parent[n] = ng,node
+                    heapq.heappush(frontier,(ng+distance(n,end),ng,n))
+        return []
+
     def solid(self, x, y, low, high):
         return any(base < high and top > low for base, top in
                    self.cells.get((math.floor(x/4), math.floor(y/4)), ()))
@@ -54,7 +114,7 @@ class Arena:
 
 
 class Bot:
-    name = "Highveld"
+    name = "Highveld II"
 
     def __init__(self, hello):
         self.map = Arena(hello["map"]["dir"])
@@ -66,6 +126,12 @@ class Bot:
         self.jet_until = -10
         self.last_bearing = None
         self.heard_at = -10
+        self.route_goal = None
+        self.route_nodes = []
+        self.route_time = -10
+        self.focus = None
+        self.recovering = False
+        self.loot_memory = {}
 
     def move(self, obs, goal, threats, retreat):
         me, zone = obs["self"], obs["zone"]
@@ -74,7 +140,7 @@ class Bot:
         if now - self.last_plan >= 0.29:
             b = self.map.bounds
             best = -math.inf
-            near_center = zone["radius"] < 35 and not threats and distance((x,y),goal) < 15
+            near_center = distance((x,y),goal) < 15
             headings = [(0,0), *DIRECTIONS]
             if near_center:
                 headings.append(((goal[0]-x)/14,(goal[1]-y)/14))
@@ -95,7 +161,8 @@ class Bot:
                     outward = (dx*(x-p[0])+dy*(y-p[1]))/dist
                     side = (dx*(p[1]-y)-dy*(p[0]-x))/dist
                     score += outward * (13 if retreat or dist < 30 else 3)
-                    score += side * (6 if math.sin(now*1.2+self.phase)>0 else -6)
+                    lateral = 13 if not retreat and dist < 150 else 6
+                    score += side * (lateral if math.sin(now*1.2+self.phase)>0 else -lateral)
                     if retreat and not self.map.clear((*q,z+6), (p[0],p[1],p[2]+7)):
                         score += 13
                 if score > best:
@@ -116,7 +183,13 @@ class Bot:
         muzzle = (x,y,z+me["stats"]["muzzle_height"])
         enemies = sorted((e for e in obs["mechs"] if e["kind"]=="mech"),
                          key=lambda e:distance(pos,e["pos"]))
-        retreat = len(enemies)>=3 or me["hp"]<0.5*me["max_hp"]
+        health = me["hp"]/me["max_hp"]
+        if health < 0.53:
+            self.recovering = True
+        elif health > 0.85:
+            self.recovering = False
+        local_pressure = sum(distance(pos,e["pos"]) < 105 for e in enemies)
+        retreat = local_pressure >= 2 or self.recovering
         sec = me["weapons"][1]
         kind = sec["kind"] if sec else "gun"
         gun = me["weapons"][0]
@@ -127,17 +200,29 @@ class Bot:
                 PRIORITIES.index(choices[i]["id"]) if choices[i]["id"] in PRIORITIES else 99)
         goal = zone["next_center"]
         options = []
-        for p in obs["pickups"]:
+        # Cubes and weapons disappear from the sensors when the torso turns.
+        visible_ids = {item["id"] for item in (*obs["cubes"], *obs["pickups"])}
+        for key,(item,seen) in list(self.loot_memory.items()):
+            if now-seen > 12 or (key not in visible_ids and math.dist(pos,item["pos"]) < 7):
+                del self.loot_memory[key]
+        for item in (*obs["cubes"], *obs["pickups"]):
+            self.loot_memory[item["id"]] = (item,now)
+        for p,_ in self.loot_memory.values():
+            if abs(p["pos"][2]-z) > 9:
+                continue
+            if "kind" not in p:
+                options.append((math.dist(pos,p["pos"])-50,p["pos"]))
+                continue
             gain = LOOT.get(p["kind"],0)-LOOT[kind]
             if gain<=0:
                 continue
             d = math.dist(pos,p["pos"])
-            if d < self.cfg["loot"]["pickup_radius"]:
+            if p["id"] in visible_ids and d < self.cfg["loot"]["pickup_radius"]:
                 action["take"] = p["id"]
                 if sec:
                     action["drop"] = 1
             options.append((d-12*gain,p["pos"]))
-        options.extend((math.dist(pos,c["pos"])-42,c["pos"]) for c in obs["cubes"])
+
         options.extend((math.dist(pos,c["pos"])+6,c["pos"]) for c in obs["crates"])
         for drop in obs["drops"]:
             d = distance(pos,drop["pos"])
@@ -147,6 +232,14 @@ class Bot:
             cost, item = min(options,key=lambda o:o[0])
             if cost<90:
                 goal = item
+        if enemies and not retreat and distance(pos,enemies[0]["pos"]) < 135:
+            # Keep a duel moving across the opponent's view without walking into it.
+            nearest = enemies[0]["pos"]
+            gap = max(1,distance(pos,nearest))
+            desired = 34 if kind == "lightning" else 72
+            if gap < desired or not options:
+                goal = (nearest[0]+(x-nearest[0])*desired/gap,
+                        nearest[1]+(y-nearest[1])*desired/gap)
         if enemies and retreat:
             e = enemies[0]["pos"]
             d = max(1,distance(pos,e))
@@ -160,6 +253,20 @@ class Bot:
             if zone["radius"]<35:
                 retreat = False
         threats = enemies if zone["radius"]>10 else []
+        if (not threats or not me["in_zone"]) and distance(pos,goal)>16 and abs(z-self.map.ground(x,y))<4:
+            if self.route_goal is None or distance(self.route_goal,goal)>10:
+                self.route_nodes = []
+                self.route_goal = goal
+            if now-self.route_time > 2 and not self.route_nodes:
+                self.route_time = now
+                if not self.map.clear(muzzle,(goal[0],goal[1],self.map.ground(*goal[:2])+6)):
+                    self.route_nodes = self.map.route(pos,goal)
+            while self.route_nodes and distance(pos,self.route_nodes[0])<5:
+                self.route_nodes.pop(0)
+            if self.route_nodes:
+                goal = self.route_nodes[0]
+        else:
+            self.route_nodes = []
         action.update(self.move(obs,goal,threats,retreat))
         for event in [*obs["sounds"],*obs["events"]]:
             if event.get("bearing") is not None and (event.get("type")=="damaged" or event.get("dist") in ("near","mid")):
@@ -176,12 +283,22 @@ class Bot:
             if d > max(gun["stats"]["range"],sec["stats"].get("range",0) if sec else 0):
                 continue
             cost = d + 0.062*target.get("hp",1000) + {"mech":0,"npc":95,"crate":108}[typ]
+            if target["id"] == self.focus:
+                cost -= 32
+            if typ == "mech":
+                cost -= 32
             candidates.append((cost,target,dst,d))
         for _,target,dst,d in sorted(candidates,key=lambda c:c[0]):
             if not self.map.clear(muzzle,dst):
                 continue
-            if retreat and me["hp"]<0.65*me["max_hp"] and target.get("kind")!="mech":
+            # Dealing damage restarts the game's regeneration delay.
+            if self.recovering and zone["radius"] > 30 and (
+                    target.get("kind") != "mech" or
+                    (d > 85 and target.get("hp",1000) > 180)):
                 continue
+            if retreat and health < 0.65 and target.get("kind")!="mech":
+                continue
+            self.focus = target["id"]
             vx,vy,vz = target.get("vel",(0,0,0))
             flight = d/gun["stats"]["speed"]
             laser = kind=="laser" and d<sec["stats"]["range"] and sec["cooldown"]<=0.1
