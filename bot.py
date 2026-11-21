@@ -8,8 +8,8 @@ import mechfight
 
 TAU = math.tau
 DIRECTIONS = [(math.cos(i * TAU / 24), math.sin(i * TAU / 24)) for i in range(24)]
-PRIORITIES = "nanites plating armor gun_damage gun_mag laser_damage laser_charge gun_rate servos jets lightning_range reactor".split()
-LOOT = {"laser": 3, "lightning": 2, "mortar": 1, "gun": 0}
+PRIORITIES = "gun_mag gun_damage plating armor lightning_range gun_rate nanites lightning_efficiency laser_damage servos reactor jets".split()
+LOOT = {"laser": 2, "lightning": 3, "mortar": 1, "gun": 0}
 
 
 def distance(a, b):
@@ -114,7 +114,7 @@ class Arena:
 
 
 class Bot:
-    name = "Highveld II"
+    name = "Highveld III"
 
     def __init__(self, hello):
         self.map = Arena(hello["map"]["dir"])
@@ -132,8 +132,11 @@ class Bot:
         self.focus = None
         self.recovering = False
         self.loot_memory = {}
+        self.last_enemy_pos = {}
+        self.reward_pos = None
+        self.reward_until = 0
 
-    def move(self, obs, goal, threats, retreat):
+    def move(self, obs, goal, threats, retreat, duel):
         me, zone = obs["self"], obs["zone"]
         x,y,z = me["pos"]
         now = obs["t"]
@@ -160,8 +163,8 @@ class Bot:
                     dist = max(1,distance((x,y),p))
                     outward = (dx*(x-p[0])+dy*(y-p[1]))/dist
                     side = (dx*(p[1]-y)-dy*(p[0]-x))/dist
-                    score += outward * (13 if retreat or dist < 30 else 3)
-                    lateral = 13 if not retreat and dist < 150 else 6
+                    score += outward * (13 if retreat else 1)
+                    lateral = 9 if duel else 6
                     score += side * (lateral if math.sin(now*1.2+self.phase)>0 else -lateral)
                     if retreat and not self.map.clear((*q,z+6), (p[0],p[1],p[2]+7)):
                         score += 13
@@ -188,8 +191,22 @@ class Bot:
             self.recovering = True
         elif health > 0.85:
             self.recovering = False
-        local_pressure = sum(distance(pos,e["pos"]) < 105 for e in enemies)
-        retreat = local_pressure >= 2 or self.recovering
+        visible = [e for e in enemies if self.map.clear(muzzle, (*e["pos"][:2],e["pos"][2]+5))]
+        for e in enemies:
+            self.last_enemy_pos[e["id"]] = (e["pos"],now)
+        for ev in obs["events"]:
+            if ev["type"] == "kill" and ev["target"] in self.last_enemy_pos:
+                point,seen = self.last_enemy_pos[ev["target"]]
+                if now-seen < 2:
+                    self.reward_pos, self.reward_until = point,now+9
+        local_pressure = sum(distance(pos,e["pos"]) < 120 for e in visible)
+        def duel_cost(e):
+            return (distance(pos,e["pos"]) + 0.11*e.get("hp",1000)
+                    - (30 if e["id"] == self.focus else 0))
+        rival = min(visible,key=duel_cost,default=None)
+        finish = rival is not None and rival.get("hp",1000) <= 0.22*me["hp"]
+        retreat = local_pressure >= 3 or (local_pressure >= 2 and not finish) or (self.recovering and not finish)
+        duel = rival is not None and not retreat
         sec = me["weapons"][1]
         kind = sec["kind"] if sec else "gun"
         gun = me["weapons"][0]
@@ -207,6 +224,7 @@ class Bot:
                 del self.loot_memory[key]
         for item in (*obs["cubes"], *obs["pickups"]):
             self.loot_memory[item["id"]] = (item,now)
+        best_take = (0,-math.inf)
         for p,_ in self.loot_memory.values():
             if abs(p["pos"][2]-z) > 9:
                 continue
@@ -217,11 +235,12 @@ class Bot:
             if gain<=0:
                 continue
             d = math.dist(pos,p["pos"])
-            if p["id"] in visible_ids and d < self.cfg["loot"]["pickup_radius"]:
+            if p["id"] in visible_ids and d < self.cfg["loot"]["pickup_radius"] and (gain,-d)>best_take:
+                best_take = gain,-d
                 action["take"] = p["id"]
                 if sec:
                     action["drop"] = 1
-            options.append((d-12*gain,p["pos"]))
+            options.append((d-27*gain,p["pos"]))
 
         options.extend((math.dist(pos,c["pos"])+6,c["pos"]) for c in obs["crates"])
         for drop in obs["drops"]:
@@ -232,14 +251,27 @@ class Bot:
             cost, item = min(options,key=lambda o:o[0])
             if cost<90:
                 goal = item
-        if enemies and not retreat and distance(pos,enemies[0]["pos"]) < 135:
-            # Keep a duel moving across the opponent's view without walking into it.
-            nearest = enemies[0]["pos"]
+        if self.reward_pos and now < self.reward_until and not retreat:
+            if distance(pos,self.reward_pos) < 8 or obs["cubes"]:
+                self.reward_pos = None
+            else:
+                goal = self.reward_pos
+        if duel:
+            # Set the radius of the orbit from the equipped game ability.
+            nearest = rival["pos"]
             gap = max(1,distance(pos,nearest))
-            desired = 34 if kind == "lightning" else 72
-            if gap < desired or not options:
-                goal = (nearest[0]+(x-nearest[0])*desired/gap,
-                        nearest[1]+(y-nearest[1])*desired/gap)
+            desired = 0.70*sec["stats"]["range"] if kind == "lightning" else 58
+            if kind == "laser":
+                desired = 95
+            gear = [p for p in obs["pickups"] if LOOT.get(p["kind"],0)>LOOT[kind]
+                    and math.dist(pos,p["pos"]) < 20 and abs(p["pos"][2]-z)<4]
+            if gear:
+                goal = min(gear,key=lambda p:math.dist(pos,p["pos"]))["pos"]
+            else:
+                ux,uy = (x-nearest[0])/gap,(y-nearest[1])/gap
+                tangent = 13 if math.sin(now*1.2+self.phase)>0 else -13
+                goal = (nearest[0]+ux*desired-uy*tangent,
+                        nearest[1]+uy*desired+ux*tangent)
         if enemies and retreat:
             e = enemies[0]["pos"]
             d = max(1,distance(pos,e))
@@ -267,7 +299,7 @@ class Bot:
                 goal = self.route_nodes[0]
         else:
             self.route_nodes = []
-        action.update(self.move(obs,goal,threats,retreat))
+        action.update(self.move(obs,goal,threats,retreat,duel))
         for event in [*obs["sounds"],*obs["events"]]:
             if event.get("bearing") is not None and (event.get("type")=="damaged" or event.get("dist") in ("near","mid")):
                 self.last_bearing, self.heard_at = event["bearing"],now
@@ -287,12 +319,14 @@ class Bot:
                 cost -= 32
             if typ == "mech":
                 cost -= 32
+            if duel and target["id"] == rival["id"]:
+                cost -= 350
             candidates.append((cost,target,dst,d))
         for _,target,dst,d in sorted(candidates,key=lambda c:c[0]):
             if not self.map.clear(muzzle,dst):
                 continue
             # Dealing damage restarts the game's regeneration delay.
-            if self.recovering and zone["radius"] > 30 and (
+            if self.recovering and not finish and zone["radius"] > 30 and (
                     target.get("kind") != "mech" or
                     (d > 85 and target.get("hp",1000) > 180)):
                 continue
@@ -318,7 +352,9 @@ class Bot:
             if laser:
                 action["fire"][1] = sec["charge"] < sec["stats"]["charge"] or not aligned
             elif kind=="lightning":
-                action["fire"][1] = d<sec["stats"]["range"] and me["energy"]>5
+                action["fire"][1] = (d < sec["stats"]["range"] and
+                                     angle_error(me["aim"][0],yaw) < math.radians(sec["stats"]["cone_deg"]) and
+                                     me["energy"] >= sec["stats"]["energy"])
             elif mortar:
                 action["fire"][1] = aligned
             break
